@@ -16,8 +16,6 @@ jobs:
           gradle-version: '8.7'
       - name: Unzip project
         run: unzip -q project.zip -d proj
-      - name: Decode keystore
-        run: echo "${{ secrets.KEYSTORE_B64 }}" | base64 -d > proj/release.keystore
       - name: Build release APK
         working-directory: proj
         env:
