@@ -1,0 +1,352 @@
+name: Build Signed Release APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        run: |
+          export ANDROID_SDK_ROOT=$HOME/android-sdk
+          mkdir -p $ANDROID_SDK_ROOT/cmdline-tools
+          cd $ANDROID_SDK_ROOT/cmdline-tools
+          curl -sS -o cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q cmdline-tools.zip
+          mv cmdline-tools latest
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> $GITHUB_PATH
+          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
+          $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Install npm dependencies
+        run: npm install
+
+      - name: Add Android platform
+        run: |
+          npx cap add android || true
+          npx cap sync android
+
+      - name: Apply custom app icon
+        run: |
+          for d in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+            cp icon-$d.png android/app/src/main/res/mipmap-$d/ic_launcher.png
+            cp icon-$d.png android/app/src/main/res/mipmap-$d/ic_launcher_round.png
+          done
+
+      - name: Add ad network dependencies to build.gradle
+        run: |
+          python3 - << 'PYEOF'
+          path = "android/app/build.gradle"
+          with open(path) as f:
+              content = f.read()
+          marker = "dependencies {"
+          idx = content.index(marker) + len(marker)
+          deps = (
+              "\n    implementation 'com.google.android.gms:play-services-ads:23.6.0'"
+              "\n    implementation 'com.unity3d.ads:unity-ads:4.19.0'"
+              "\n    implementation 'com.startapp:inapp-sdk:5.+'"
+          )
+          content = content[:idx] + deps + content[idx:]
+          with open(path, "w") as f:
+              f.write(content)
+          PYEOF
+
+      - name: Add ad network IDs to AndroidManifest.xml
+        run: |
+          python3 - << 'PYEOF'
+          path = "android/app/src/main/AndroidManifest.xml"
+          with open(path) as f:
+              content = f.read()
+          meta = (
+              '        <meta-data android:name="com.google.android.gms.ads.APPLICATION_ID" android:value="ca-app-pub-1493112125477027~9352723284"/>\n'
+              '        <meta-data android:name="com.startapp.sdk.APPLICATION_ID" android:value="208690222"/>\n'
+          )
+          content = content.replace("</application>", meta + "    </application>", 1)
+          with open(path, "w") as f:
+              f.write(content)
+          PYEOF
+
+      - name: Write MainActivity.java with real ad code
+        run: |
+          MAIN_ACTIVITY=$(find android/app/src/main/java -name "MainActivity.java")
+          PACKAGE_LINE=$(head -n 1 "$MAIN_ACTIVITY")
+          cat > "$MAIN_ACTIVITY" << JAVAEOF
+          $PACKAGE_LINE
+
+          import android.os.Bundle;
+          import android.view.Gravity;
+          import android.view.ViewGroup;
+          import android.webkit.JavascriptInterface;
+          import android.widget.FrameLayout;
+          import androidx.annotation.NonNull;
+          import androidx.annotation.Nullable;
+          import com.getcapacitor.BridgeActivity;
+
+          import com.google.android.gms.ads.AdRequest;
+          import com.google.android.gms.ads.AdSize;
+          import com.google.android.gms.ads.AdView;
+          import com.google.android.gms.ads.MobileAds;
+          import com.google.android.gms.ads.interstitial.InterstitialAd;
+          import com.google.android.gms.ads.interstitial.InterstitialAdLoadCallback;
+          import com.google.android.gms.ads.rewarded.RewardedAd;
+          import com.google.android.gms.ads.rewarded.RewardedAdLoadCallback;
+
+          import com.unity3d.ads.UnityAds;
+          import com.unity3d.ads.IUnityAdsInitializationListener;
+          import com.unity3d.ads.IUnityAdsLoadListener;
+          import com.unity3d.ads.IUnityAdsShowListener;
+          import com.unity3d.ads.UnityAdsShowOptions;
+
+          import com.startapp.sdk.adsbase.StartAppAd;
+          import com.startapp.sdk.adsbase.StartAppSDK;
+          import com.startapp.sdk.adsbase.Ad;
+          import com.startapp.sdk.adsbase.adlisteners.AdEventListener;
+
+          public class MainActivity extends BridgeActivity {
+              private InterstitialAd admobInterstitial;
+              private RewardedAd admobRewarded;
+              private boolean unityInterstitialReady = false;
+              private boolean unityRewardedReady = false;
+              private StartAppAd startAppInterstitial;
+
+              private static final String ADMOB_BANNER = "ca-app-pub-1493112125477027/2647803420";
+              private static final String ADMOB_INTERSTITIAL = "ca-app-pub-1493112125477027/3904955481";
+              private static final String ADMOB_REWARDED = "ca-app-pub-1493112125477027/5172885252";
+
+              private static final String UNITY_GAME_ID = "800379873";
+              private static final String UNITY_INTERSTITIAL = "BP_Interstitial_Android";
+              private static final String UNITY_REWARDED = "BP_Rewarded_Android";
+
+              private static final String STARTIO_APP_ID = "208690222";
+
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  MobileAds.initialize(this, initStatus -> {});
+
+                  UnityAds.initialize(getApplicationContext(), UNITY_GAME_ID, false, new IUnityAdsInitializationListener() {
+                      @Override
+                      public void onInitializationComplete() {
+                          loadUnityInterstitial();
+                          loadUnityRewarded();
+                      }
+                      @Override
+                      public void onInitializationFailed(UnityAds.UnityAdsInitializationError error, String message) {}
+                  });
+
+                  StartAppSDK.initParams(getApplicationContext(), STARTIO_APP_ID)
+                          .setReturnAdsEnabled(false)
+                          .init();
+
+                  this.bridge.getWebView().addJavascriptInterface(new AdBridge(), "NativeAdBridge");
+
+                  loadBanner();
+                  loadAdMobInterstitial();
+                  loadAdMobRewarded();
+                  loadStartAppInterstitial();
+              }
+
+              private void loadBanner() {
+                  AdView bannerAdView = new AdView(this);
+                  bannerAdView.setAdUnitId(ADMOB_BANNER);
+                  bannerAdView.setAdSize(AdSize.BANNER);
+                  FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                          FrameLayout.LayoutParams.WRAP_CONTENT,
+                          FrameLayout.LayoutParams.WRAP_CONTENT);
+                  params.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+                  ViewGroup rootView = findViewById(android.R.id.content);
+                  rootView.addView(bannerAdView, params);
+                  bannerAdView.loadAd(new AdRequest.Builder().build());
+              }
+
+              private void loadAdMobInterstitial() {
+                  InterstitialAd.load(this, ADMOB_INTERSTITIAL, new AdRequest.Builder().build(),
+                      new InterstitialAdLoadCallback() {
+                          @Override
+                          public void onAdLoaded(@NonNull InterstitialAd ad) {
+                              admobInterstitial = ad;
+                          }
+                      });
+              }
+
+              private void loadAdMobRewarded() {
+                  RewardedAd.load(this, ADMOB_REWARDED, new AdRequest.Builder().build(),
+                      new RewardedAdLoadCallback() {
+                          @Override
+                          public void onAdLoaded(@NonNull RewardedAd ad) {
+                              admobRewarded = ad;
+                          }
+                      });
+              }
+
+              private void loadUnityInterstitial() {
+                  UnityAds.load(UNITY_INTERSTITIAL, new IUnityAdsLoadListener() {
+                      @Override
+                      public void onUnityAdsAdLoaded(String placementId) {
+                          unityInterstitialReady = true;
+                      }
+                      @Override
+                      public void onUnityAdsFailedToLoad(String placementId, UnityAds.UnityAdsLoadError error, String message) {
+                          unityInterstitialReady = false;
+                      }
+                  });
+              }
+
+              private void loadUnityRewarded() {
+                  UnityAds.load(UNITY_REWARDED, new IUnityAdsLoadListener() {
+                      @Override
+                      public void onUnityAdsAdLoaded(String placementId) {
+                          unityRewardedReady = true;
+                      }
+                      @Override
+                      public void onUnityAdsFailedToLoad(String placementId, UnityAds.UnityAdsLoadError error, String message) {
+                          unityRewardedReady = false;
+                      }
+                  });
+              }
+
+              private void loadStartAppInterstitial() {
+                  startAppInterstitial = new StartAppAd(this);
+                  startAppInterstitial.loadAd(new AdEventListener() {
+                      @Override
+                      public void onReceiveAd(@NonNull Ad ad) {}
+                      @Override
+                      public void onFailedToReceiveAd(@Nullable Ad ad) {}
+                  });
+              }
+
+              private void showInterstitialWaterfall() {
+                  if (admobInterstitial != null) {
+                      admobInterstitial.show(MainActivity.this);
+                      admobInterstitial = null;
+                      loadAdMobInterstitial();
+                  } else if (unityInterstitialReady) {
+                      unityInterstitialReady = false;
+                      UnityAds.show(MainActivity.this, UNITY_INTERSTITIAL, new UnityAdsShowOptions(), new IUnityAdsShowListener() {
+                          @Override
+                          public void onUnityAdsShowFailure(String placementId, UnityAds.UnityAdsShowError error, String message) {}
+                          @Override
+                          public void onUnityAdsShowStart(String placementId) {}
+                          @Override
+                          public void onUnityAdsShowClick(String placementId) {}
+                          @Override
+                          public void onUnityAdsShowComplete(String placementId, UnityAds.UnityAdsShowCompletionState state) {}
+                      });
+                      loadUnityInterstitial();
+                  } else if (startAppInterstitial != null && startAppInterstitial.isReady()) {
+                      startAppInterstitial.showAd();
+                      loadStartAppInterstitial();
+                  }
+              }
+
+              private void showRewardedWaterfall() {
+                  if (admobRewarded != null) {
+                      admobRewarded.show(MainActivity.this, rewardItem -> {});
+                      admobRewarded = null;
+                      loadAdMobRewarded();
+                  } else if (unityRewardedReady) {
+                      unityRewardedReady = false;
+                      UnityAds.show(MainActivity.this, UNITY_REWARDED, new UnityAdsShowOptions(), new IUnityAdsShowListener() {
+                          @Override
+                          public void onUnityAdsShowFailure(String placementId, UnityAds.UnityAdsShowError error, String message) {}
+                          @Override
+                          public void onUnityAdsShowStart(String placementId) {}
+                          @Override
+                          public void onUnityAdsShowClick(String placementId) {}
+                          @Override
+                          public void onUnityAdsShowComplete(String placementId, UnityAds.UnityAdsShowCompletionState state) {}
+                      });
+                      loadUnityRewarded();
+                  }
+              }
+
+              public class AdBridge {
+                  @JavascriptInterface
+                  public void show(String kind) {
+                      runOnUiThread(() -> {
+                          if ("interstitial".equals(kind)) {
+                              showInterstitialWaterfall();
+                          } else if ("rewarded".equals(kind)) {
+                              showRewardedWaterfall();
+                          }
+                      });
+                  }
+              }
+          }
+          JAVAEOF
+
+      - name: Decode keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: echo "$KEYSTORE_BASE64" | base64 -d > android/app/release.keystore
+
+      - name: Configure release signing
+        run: |
+          python3 - << 'PYEOF'
+          import re
+          path = "android/app/build.gradle"
+          with open(path) as f:
+              content = f.read()
+          signing_block = '''
+          signingConfigs {
+              release {
+                  storeFile file("release.keystore")
+                  storePassword System.getenv("KEYSTORE_PASSWORD")
+                  keyAlias System.getenv("KEY_ALIAS")
+                  keyPassword System.getenv("KEY_PASSWORD")
+              }
+          }
+          '''
+          content = content.replace("android {", "android {" + signing_block, 1)
+          content = re.sub(r'(release\s*\{)', r'\1\n            signingConfig signingConfigs.release', content, count=1)
+          with open(path, "w") as f:
+              f.write(content)
+          PYEOF
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x android/gradlew
+
+      - name: Build signed release APK
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          cd android
+          ./gradlew assembleRelease
+
+      - name: Upload signed APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: aao-seekho-english-release-apk
+          path: android/app/build/outputs/apk/release/app-release.apk
+
+      - name: Publish APK to a public download link
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          files: android/app/build/outputs/apk/release/app-release.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
